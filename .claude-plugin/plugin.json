@@ -1,0 +1,7 @@
+{
+  "name": "speak-aloud",
+  "version": "0.1.0",
+  "description": "Reads Claude's responses aloud with macOS `say`: a speaker button on each reply block, /speak and /speak-stop, and /speak-voice and /speak-rate settings.",
+  "author": { "name": "Emilio Mendez" },
+  "types": "./types/index.d.ts"
+}

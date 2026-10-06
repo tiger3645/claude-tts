@@ -1,0 +1,12 @@
+{
+  "name": "emilio-mods",
+  "owner": { "name": "Emilio Mendez" },
+  "metadata": { "description": "Emilio's Claude Code mods." },
+  "plugins": [
+    {
+      "name": "speak-aloud",
+      "source": "./",
+      "description": "Reads Claude's responses aloud with macOS `say`: a speaker button on each reply block, /speak and /speak-stop, and /speak-voice and /speak-rate settings."
+    }
+  ]
+}
