@@ -15,7 +15,7 @@ function block(requestId: string, text: string, extra: { isSummary?: true } = {}
   } as const
 }
 
-type Spawned = { argv: readonly string[]; input?: string; isDone: boolean; isKilled?: boolean }
+type Spawned = { argv: readonly string[]; input?: string; isDone: boolean }
 
 /** A slice of `say -v '?'`, names with spaces and parentheses included. */
 const VOICES = [
@@ -29,7 +29,9 @@ const VOICES = [
 const HOME = '/Users/test'
 const SERVER = `${HOME}/.local/bin/mlx_audio.server`
 const SNAPSHOTS = `${HOME}/.cache/huggingface/hub/models--mlx-community--Kokoro-82M-bf16/snapshots`
-const TEMP = '/tmp/speak-aloud.abc'
+const CACHE = `${HOME}/Library/Caches/speak-aloud`
+const REGISTRY = `${CACHE}/sessions`
+const MODELS_REPLY = '{"object":"list","data":[]}'
 
 /** How the fake Kokoro behaves: whether it is installed, whether its server answers, how curl ends. */
 type Kokoro = {
@@ -50,6 +52,16 @@ type Options = {
   runs?: (readonly string[])[]
   /** More `say -v '?'` lines. */
   moreVoices?: string
+  /** Other sessions' registry entries: name to heartbeat text. */
+  others?: Record<string, string>
+  written?: Map<string, string>
+  /** What answers the health check in place of the mlx-audio server. */
+  healthReply?: string
+  /** Where uv is, if anywhere. */
+  uvAt?: string
+  /** Makes the uv step whose argv[1..2] is this fail with that stderr. */
+  uvFails?: { step: 'tool install' | 'pip install'; stderr: string }
+  statuses?: (string | undefined)[]
 }
 
 /**
@@ -66,7 +78,8 @@ function world(
   stored: Map<string, unknown> = new Map(),
   options: Omit<Options, 'during' | 'stored'> = {},
 ) {
-  const { kokoro, toasts, registered, runs, moreVoices = '' } = options
+  const { kokoro, toasts, registered, runs, moreVoices = '', others = {}, written = new Map(), healthReply, uvAt, uvFails, statuses } = options
+  let isInstalledNow = false
   if (kokoro === undefined && !stored.has('engine')) stored.set('engine', 'say')
   let curls = 0
   on('store.get', (_$, e) => ({ value: stored.get(e.key) }))
@@ -80,12 +93,33 @@ function world(
   })
   on('store.keys', () => ({ value: [...stored.keys()] }))
   mock.env(on, { HOME })
-  on('fs.exists', (_$, e) => ({ value: kokoro?.isInstalled === true && e.path === SERVER }))
-  on('fs.list', (_$, e) => {
-    if (kokoro?.voiceFiles === undefined) throw new Error('ENOENT')
-    const names = e.path === SNAPSHOTS ? ['snap1'] : kokoro.voiceFiles
-    return { value: names.map(name => ({ name, kind: 'file', size: 1 })) as never }
+  on('fs.exists', (_$, e) => ({
+    value: (e.path === SERVER && (kokoro?.isInstalled === true || isInstalledNow)) || (uvAt !== undefined && e.path === uvAt),
+  }))
+  on('ui.status', (_$, e) => {
+    statuses?.push(e.text)
+    return { value: undefined }
   })
+  on('fs.list', (_$, e) => {
+    const files = (names: string[]) => ({ value: names.map(name => ({ name, kind: 'file', size: 1 })) as never })
+    if (e.path === REGISTRY) {
+      const mine = [...written.keys()].filter(k => k.startsWith(`${REGISTRY}/`)).map(k => k.slice(REGISTRY.length + 1))
+      return files([...Object.keys(others), ...mine])
+    }
+    if (kokoro?.voiceFiles === undefined) throw new Error('ENOENT')
+    return files(e.path === SNAPSHOTS ? ['snap1'] : kokoro.voiceFiles)
+  })
+  on('fs.read', (_$, e) => {
+    const name = e.path.slice(REGISTRY.length + 1)
+    const text = others[name] ?? written.get(e.path)
+    if (text === undefined) throw new Error('ENOENT')
+    return { value: text }
+  })
+  on('fs.write', (_$, e) => {
+    written.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('session.id', () => ({ value: 'sess-1' }))
   on('ui.toast', (_$, e) => {
     toasts?.push(e.text)
     return { value: undefined }
@@ -114,25 +148,25 @@ function world(
       value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
     })
     if (line === 'say -v ?') return ok(VOICES + moreVoices)
-    if (line.startsWith('/usr/bin/mktemp')) return ok(`${TEMP}\n`)
-    if (line.startsWith('/usr/bin/curl -sf')) return kokoro?.isUp?.() === true ? ok() : { value: { ...ok().value, exitCode: 7 } }
-    if (line.startsWith('/usr/bin/curl')) return ok()
+    if (line.startsWith('/usr/bin/curl -sf')) {
+      if (healthReply !== undefined) return ok(healthReply)
+      return kokoro?.isUp?.() === true ? ok(MODELS_REPLY) : { value: { ...ok().value, exitCode: 7 } }
+    }
+    if (uvAt !== undefined && e.argv[0] === uvAt) {
+      const step = e.argv.slice(1, 3).join(' ')
+      if (uvFails?.step === step) return { value: { ...ok().value, exitCode: 2, stderr: uvFails.stderr } }
+      if (step === 'tool install') isInstalledNow = true
+      return ok()
+    }
+    if (line.startsWith('/usr/sbin/lsof')) return ok('4242\n')
+    if (line.startsWith('/bin/ps')) return ok(`${HOME}/.local/share/uv/tools/mlx-audio/bin/python ${SERVER} --port 8765\n`)
+    const known = ['/usr/bin/curl', '/bin/sh', '/bin/kill', '/bin/mkdir', '/bin/rm', '/usr/bin/find']
+    if (known.includes(e.argv[0]!)) return ok()
     return { value: { ...ok().value, exitCode: 1 } }
   })
-  on('process.spawn', async function* (_$, e, next) {
+  on('process.spawn', async function* (_$, e) {
     const one: Spawned = { argv: e.argv, input: e.input, isDone: false }
     spawned.push(one)
-    if (e.argv[0] === SERVER) {
-      yield { stream: 'stderr', text: 'starting' } as const
-      // The server runs until its loop is ended.
-      await new Promise<void>(resolve =>
-        next.signal.addEventListener('abort', () => {
-          one.isKilled = true
-          resolve()
-        }),
-      )
-      return { value: { code: null, signal: 'SIGTERM' } }
-    }
     const code = e.argv[0] === '/usr/bin/curl' ? (kokoro?.curlCode?.(curls++) ?? 0) : 0
     yield { stream: 'stdout', text: ' ' } as const
     if (during) await during(one)
@@ -180,7 +214,7 @@ test('each reply block keeps the engine drawing and adds an idle speaker button'
 test('summary blocks and blocks with nothing to say get no button', async ($, on) => {
   world(on, [])
   for (const surface of SURFACES) {
-    for (const one of [block('s1', 'Ran 3 tools', { isSummary: true }), block('e1', '  ')]) {
+    for (const one of [block('s1', 'Ran 3 tools', { isSummary: true }), block('e1', '  '), block('c1', '```\nls\n```')]) {
       const ui = await $.ui.mount({ ...one, surface })
       expect(await ui.find({ key: 'engine' })).toBeDefined()
       expect(await ui.find({ type: 'Button' })).toBeUndefined()
@@ -201,28 +235,37 @@ test('a surface table without Button leaves the engine drawing alone', async ($,
   expect(await ui.find({ type: 'Button' })).toBeUndefined()
 })
 
+/** A fake child's `during` that holds it "playing" until the test lets it go. */
+function gated() {
+  const waiting: (() => void)[] = []
+  return {
+    during: () => new Promise<void>(resolve => waiting.push(resolve)),
+    release: () => waiting.splice(0).forEach(resolve => resolve()),
+  }
+}
+
 test('pressing a block speaks its stripped text; only that block shows stop, then flips back', async ($, on) => {
+  const clock = mock.clock(on)
   const spawned: Spawned[] = []
-  const box: { a?: Mounted<'terminal', 'AssistantMessage'>; b?: Mounted<'terminal', 'AssistantMessage'> } = {}
-  let midA: string[] = []
-  let midB: string[] = []
-  world(on, spawned, async () => {
-    midA = await buttonKeys(box.a!)
-    midB = await buttonKeys(box.b!)
-  })
-  box.a = await $.ui.mount({ ...block('a', '# Done\n\nSee `x` and\n\n```\ncode\n```'), surface: 'terminal' })
-  box.b = await $.ui.mount({ ...block('b', 'Other block'), surface: 'terminal' })
-  await box.a.press({ key: 'speak' })
+  const gate = gated()
+  world(on, spawned, gate.during)
+  const a = await $.ui.mount({ ...block('a', '# Done\n\nSee `x` and\n\n```\ncode\n```'), surface: 'terminal' })
+  const b = await $.ui.mount({ ...block('b', 'Other block'), surface: 'terminal' })
+  await a.press({ key: 'speak' })
+  await clock.settle()
 
   expect(spawned).toHaveLength(1)
-  expect(spawned[0]?.input).toBe('Done\n\nSee x and\n\nCode block omitted.')
+  expect(spawned[0]?.input).toBe('Done\n\nSee x and')
+  expect(await buttonKeys(a)).toEqual(['stop'])
+  expect(await buttonKeys(b)).toEqual(['speak'])
+  gate.release()
+  await clock.settle()
   expect(spawned[0]?.isDone).toBe(true)
-  expect(midA).toEqual(['stop'])
-  expect(midB).toEqual(['speak'])
-  expect(await buttonKeys(box.a)).toEqual(['speak'])
+  expect(await buttonKeys(a)).toEqual(['speak'])
 })
 
 test('stop on the speaking block kills say', async ($, on) => {
+  const clock = mock.clock(on)
   const spawned: Spawned[] = []
   const box: { a?: Mounted<'terminal', 'AssistantMessage'> } = {}
   world(on, spawned, async () => {
@@ -230,6 +273,7 @@ test('stop on the speaking block kills say', async ($, on) => {
   })
   box.a = await $.ui.mount({ ...block('a', 'A long answer'), surface: 'terminal' })
   await box.a.press({ key: 'speak' })
+  await clock.settle()
 
   expect(spawned).toHaveLength(1)
   expect(spawned[0]?.isDone).toBe(false)
@@ -237,24 +281,26 @@ test('stop on the speaking block kills say', async ($, on) => {
 })
 
 test('pressing another block stops the current one and reads that one', async ($, on) => {
+  const clock = mock.clock(on)
   const spawned: Spawned[] = []
-  const box: { a?: Mounted<'terminal', 'AssistantMessage'>; b?: Mounted<'terminal', 'AssistantMessage'> } = {}
-  const seen: { a: string[]; b: string[] }[] = []
-  world(on, spawned, async () => {
-    seen.push({ a: await buttonKeys(box.a!), b: await buttonKeys(box.b!) })
-    if (spawned.length === 1) await box.b!.press({ key: 'speak' })
-  })
-  box.a = await $.ui.mount({ ...block('a', 'First block'), surface: 'terminal' })
-  box.b = await $.ui.mount({ ...block('b', 'Second block'), surface: 'terminal' })
-  await box.a.press({ key: 'speak' })
+  const gate = gated()
+  world(on, spawned, gate.during)
+  const a = await $.ui.mount({ ...block('a', 'First block'), surface: 'terminal' })
+  const b = await $.ui.mount({ ...block('b', 'Second block'), surface: 'terminal' })
+  await a.press({ key: 'speak' })
+  await clock.settle()
+  expect([await buttonKeys(a), await buttonKeys(b)]).toEqual([['stop'], ['speak']])
 
+  await b.press({ key: 'speak' })
+  await clock.settle()
   expect(spawned.map(one => one.input)).toEqual(['First block', 'Second block'])
+  expect([await buttonKeys(a), await buttonKeys(b)]).toEqual([['speak'], ['stop']])
+
+  gate.release()
+  await clock.settle()
   expect(spawned[0]?.isDone).toBe(false)
   expect(spawned[1]?.isDone).toBe(true)
-  expect(seen).toEqual([
-    { a: ['stop'], b: ['speak'] },
-    { a: ['speak'], b: ['stop'] },
-  ])
+  expect(await buttonKeys(b)).toEqual(['speak'])
 })
 
 test('the band above the prompt is left to the engine', async ($, on) => {
@@ -353,6 +399,7 @@ test('/speak-stop stops speech, and says so when idle', async ($, on) => {
 })
 
 test('/speak-stop also stops a block read from its button', async ($, on) => {
+  const clock = mock.clock(on)
   const spawned: Spawned[] = []
   let stopped = ''
   world(on, spawned, async () => {
@@ -360,6 +407,7 @@ test('/speak-stop also stops a block read from its button', async ($, on) => {
   })
   const ui = await $.ui.mount({ ...block('a', 'Block'), surface: 'terminal' })
   await ui.press({ key: 'speak' })
+  await clock.settle()
   expect(stopped).toMatch(/stopped/i)
   expect(spawned[0]?.isDone).toBe(false)
   expect(await buttonKeys(ui)).toEqual(['speak'])
@@ -528,6 +576,7 @@ function speechBody(one: Spawned | undefined) {
 const named = (spawned: Spawned[], program: string) => spawned.filter(one => one.argv[0] === program)
 
 test('Kokoro reads each paragraph in its language, the next chunk made while one plays', async ($, on) => {
+  const clock = mock.clock(on)
   const spawned: Spawned[] = []
   // Snapshot of what was spawned when the first afplay starts.
   let atFirstPlay: string[] = []
@@ -542,6 +591,7 @@ test('Kokoro reads each paragraph in its language, the next chunk made while one
   )
   const ui = await $.ui.mount({ ...block('a', MIXED), surface: 'terminal' })
   await ui.press({ key: 'speak' })
+  await clock.settle()
 
   const curls = named(spawned, '/usr/bin/curl')
   expect(curls).toHaveLength(2)
@@ -551,24 +601,27 @@ test('Kokoro reads each paragraph in its language, the next chunk made while one
   expect(speechBody(curls[1])).toEqual(expect.objectContaining({ voice: 'ef_dora', lang_code: 'e' }))
   expect(atFirstPlay).toEqual(['/usr/bin/curl', '/usr/bin/curl', '/usr/bin/afplay'])
   const plays = named(spawned, '/usr/bin/afplay')
-  expect(plays.map(p => p.argv[1])).toEqual([`${TEMP}/1.wav`, `${TEMP}/2.wav`])
+  expect(plays.map(p => p.argv[1])).toEqual([expect.stringMatching(/^\/Users\/test\/Library\/Caches\/speak-aloud\/wav\/\w+-1\.wav$/), expect.stringMatching(/-2\.wav$/)])
   expect(plays.every(p => p.isDone)).toBe(true)
   expect(named(spawned, 'say')).toHaveLength(0)
   expect(await buttonKeys(ui)).toEqual(['speak'])
 })
 
 test('Kokoro voices and rate kept in the store reach the request', async ($, on) => {
+  const clock = mock.clock(on)
   const spawned: Spawned[] = []
   const stored = new Map<string, unknown>(Object.entries({ kokoroVoiceEn: 'bm_george', kokoroVoiceEs: 'em_alex', rate: 306 }))
   world(on, spawned, undefined, stored, { kokoro: UP })
   const ui = await $.ui.mount({ ...block('a', MIXED), surface: 'terminal' })
   await ui.press({ key: 'speak' })
+  await clock.settle()
   const [en, es] = named(spawned, '/usr/bin/curl').map(speechBody)
   expect(en).toEqual(expect.objectContaining({ voice: 'bm_george', lang_code: 'b', speed: 2 }))
   expect(es).toEqual(expect.objectContaining({ voice: 'em_alex', lang_code: 'e', speed: 2 }))
 })
 
 test('stop during Kokoro playback kills afplay and the chunk being made, and reads no more', async ($, on) => {
+  const clock = mock.clock(on)
   const spawned: Spawned[] = []
   const box: { a?: Mounted<'terminal', 'AssistantMessage'> } = {}
   world(
@@ -582,6 +635,7 @@ test('stop during Kokoro playback kills afplay and the chunk being made, and rea
   )
   box.a = await $.ui.mount({ ...block('a', MIXED), surface: 'terminal' })
   await box.a.press({ key: 'speak' })
+  await clock.settle()
   const plays = named(spawned, '/usr/bin/afplay')
   expect(plays).toHaveLength(1)
   expect(plays[0]?.isDone).toBe(false)
@@ -590,6 +644,7 @@ test('stop during Kokoro playback kills afplay and the chunk being made, and rea
 })
 
 test('Kokoro not installed: say reads instead, Spanish in the first Spanish voice, one toast', async ($, on) => {
+  const clock = mock.clock(on, { now: 1000 })
   const spawned: Spawned[] = []
   const toasts: string[] = []
   world(on, spawned, undefined, undefined, {
@@ -599,7 +654,9 @@ test('Kokoro not installed: say reads instead, Spanish in the first Spanish voic
   })
   const ui = await $.ui.mount({ ...block('a', MIXED), surface: 'terminal' })
   await ui.press({ key: 'speak' })
+  await clock.settle()
   await ui.press({ key: 'speak' })
+  await clock.settle()
 
   const says = named(spawned, 'say')
   expect(says.map(s => s.argv)).toEqual([
@@ -610,43 +667,142 @@ test('Kokoro not installed: say reads instead, Spanish in the first Spanish voic
   ])
   expect(named(spawned, '/usr/bin/curl')).toHaveLength(0)
   expect(toasts).toHaveLength(1)
-  expect(toasts[0]).toMatch(/not installed/)
+  expect(toasts[0]).toMatch(/not installed.*\/speak-install/)
 })
 
 test('a failed Kokoro request hands the rest of the read to say', async ($, on) => {
+  const clock = mock.clock(on)
   const spawned: Spawned[] = []
   const toasts: string[] = []
   world(on, spawned, undefined, undefined, { kokoro: { ...UP, curlCode: n => (n === 1 ? 22 : 0) }, toasts })
   const ui = await $.ui.mount({ ...block('a', MIXED), surface: 'terminal' })
   await ui.press({ key: 'speak' })
+  await clock.settle()
   expect(named(spawned, '/usr/bin/afplay')).toHaveLength(1)
   const says = named(spawned, 'say')
   expect(says.map(s => s.input)).toEqual(['Y aquí está la explicación en español para el equipo.'])
   expect(toasts).toHaveLength(1)
 })
 
-test('with Kokoro installed but down, the mod starts its server, waits for it, and stops it at session end', async ($, on) => {
-  const clock = mock.clock(on)
+test('with Kokoro installed but down, the mod starts a detached server in its cache, waits for it, and stops it at session end', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
   const spawned: Spawned[] = []
+  const runs: (readonly string[])[] = []
   let isUp = false
-  world(on, spawned, undefined, undefined, { kokoro: { isInstalled: true, isUp: () => isUp } })
+  world(on, spawned, undefined, undefined, { kokoro: { isInstalled: true, isUp: () => isUp }, runs })
   on('session.end', () => ({ sessionId: 's1' }))
   await answer($, 'Read this to me, it is short.')
   await runCommand($, 'speak')
   await clock.settle()
-  const servers = named(spawned, SERVER)
-  expect(servers.map(s => s.argv)).toEqual([[SERVER, '--host', '127.0.0.1', '--port', '8765']])
+  const daemons = runs.filter(r => r[0] === '/bin/sh')
+  expect(daemons).toHaveLength(1)
+  expect(daemons[0]!.slice(4)).toEqual([SERVER, '--host', '127.0.0.1', '--port', '8765', '--log-dir', `${CACHE}/logs`])
   expect(named(spawned, '/usr/bin/curl')).toHaveLength(0)
 
   isUp = true
   await clock.advance(300)
   await clock.settle()
   expect(named(spawned, '/usr/bin/afplay')).toHaveLength(1)
-  expect(named(spawned, SERVER)).toHaveLength(1)
+  expect(runs.filter(r => r[0] === '/bin/sh')).toHaveLength(1)
 
   await $.session.end({ reason: 'other' } as never)
   await clock.settle()
-  expect(servers[0]?.isKilled).toBe(true)
+  expect(runs.filter(r => r[0] === '/bin/kill')).toEqual([['/bin/kill', '4242']])
+})
+
+test('a session that ends while another live session uses the server leaves it running', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const runs: (readonly string[])[] = []
+  const written = new Map<string, string>()
+  world(on, [], undefined, undefined, {
+    kokoro: UP,
+    runs,
+    written,
+    others: { 'other-live': String(1_000_000 - 30_000), 'other-dead': String(1_000_000 - 3_600_000) },
+  })
+  on('session.end', () => ({ sessionId: 's1' }))
+  await answer($, 'Read this to me, it is short.')
+  await runCommand($, 'speak')
+  await clock.settle()
+  expect(written.get(`${REGISTRY}/sess-1`)).toBe('1000000')
+  await $.session.end({ reason: 'prompt_input_exit' } as never)
+  await clock.settle()
+  expect(runs.filter(r => r[0] === '/bin/kill')).toHaveLength(0)
+  expect(runs).toContainEqual(['/bin/rm', '-f', `${REGISTRY}/sess-1`])
+})
+
+test('a /clear keeps the server and the registry entry', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const runs: (readonly string[])[] = []
+  world(on, [], undefined, undefined, { kokoro: UP, runs })
+  on('session.end', () => ({ sessionId: 's1' }))
+  await answer($, 'Read this to me, it is short.')
+  await runCommand($, 'speak')
+  await clock.settle()
+  await $.session.end({ reason: 'clear' } as never)
+  await clock.settle()
+  expect(runs.filter(r => r[0] === '/bin/kill' || (r[0] === '/bin/rm' && r[2]?.startsWith(REGISTRY)))).toHaveLength(0)
+})
+
+test('a non-mlx-audio process answering on the port does not count as the server', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const spawned: Spawned[] = []
+  const toasts: string[] = []
+  world(on, spawned, undefined, undefined, { kokoro: { isInstalled: false }, toasts, healthReply: '<html>hi</html>' })
+  await answer($, 'Read this to me, it is short.')
+  await runCommand($, 'speak')
+  await clock.settle()
+  expect(named(spawned, 'say')).toHaveLength(1)
+  expect(named(spawned, '/usr/bin/afplay')).toHaveLength(0)
+})
+
+test('a read started while another is still starting stops it before it plays', async ($, on) => {
+  const clock = mock.clock(on)
+  const spawned: Spawned[] = []
+  world(on, spawned)
+  // The pressed read's first state write is where a second read, from /speak, cuts in.
+  let isArmed = false
+  on('state.set', async (_$, e, next) => {
+    if (isArmed) {
+      isArmed = false
+      await runCommand($, 'speak')
+      await clock.settle()
+    }
+    return next(e)
+  })
+  await answer($, 'The latest answer.')
+  const ui = await $.ui.mount({ ...block('a', 'The pressed block.'), surface: 'terminal' })
+  isArmed = true
+  await ui.press({ key: 'speak' })
+  await clock.settle()
+  expect(named(spawned, 'say').map(s => s.input)).toEqual(['The latest answer.'])
+  expect(await buttonKeys(ui)).toEqual(['speak'])
+  expect((await runCommand($, 'speak-stop')).text).toMatch(/nothing/i)
+})
+
+test('with Kokoro not installed, startup starts no server and shows the install notice once a day', async ($, on) => {
+  const clock = mock.clock(on, { now: 5_000_000 })
+  const runs: (readonly string[])[] = []
+  const toasts: string[] = []
+  const stored = new Map<string, unknown>()
+  world(on, [], undefined, stored, { kokoro: { isInstalled: false }, runs, toasts })
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  expect(runs.filter(r => r[0] === '/bin/sh')).toHaveLength(0)
+  expect(toasts).toEqual([expect.stringContaining('/speak-install')])
+  expect(stored.get('installNoticeAt')).toBe(5_000_000)
+})
+
+test('the install notice is not shown again within a day, nor with say chosen', async ($, on) => {
+  const clock = mock.clock(on, { now: 5_000_000 })
+  const toasts: string[] = []
+  const stored = new Map<string, unknown>(Object.entries({ installNoticeAt: 5_000_000 - 3_600_000 }))
+  world(on, [], undefined, stored, { kokoro: { isInstalled: false }, toasts })
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  expect(toasts).toHaveLength(0)
 })
 
 test('/speak-engine shows, sets and resets the engine', async ($, on) => {
@@ -699,4 +855,84 @@ test('/speak-voice es under say sets the Spanish say voice', async ($, on) => {
   await runCommand($, 'speak')
   await clock.settle()
   expect(spawned.at(-1)?.argv).toEqual(['say', '-v', 'Alice', '-r', '190', '-f', '-'])
+})
+
+// ---- /speak-install ----
+
+const UV = '/opt/homebrew/bin/uv'
+
+test('/speak-install without uv says how to get it', async ($, on) => {
+  world(on, [], undefined, new Map(), { kokoro: { isInstalled: false } })
+  const text = (await runCommand($, 'speak-install')).text ?? ''
+  expect(text).toContain('brew install uv')
+  expect(text).toContain('https://astral.sh/uv/install.sh')
+})
+
+test('/speak-install runs the four steps, then reads with Kokoro', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const runs: (readonly string[])[] = []
+  const toasts: string[] = []
+  const statuses: (string | undefined)[] = []
+  const stored = new Map<string, unknown>(Object.entries({ engine: 'say', installNoticeAt: 5 }))
+  let isUp = false
+  world(on, [], undefined, stored, {
+    kokoro: { isInstalled: false, isUp: () => isUp },
+    uvAt: UV,
+    runs,
+    toasts,
+    statuses,
+  })
+  expect((await runCommand($, 'speak-install')).text).toBe('Installing Kokoro… progress in the status line.')
+  await clock.settle()
+  isUp = true
+  await clock.advance(300)
+  await clock.settle()
+
+  const uvRuns = runs.filter(r => r[0] === UV)
+  expect(uvRuns[0]?.slice(0, 4)).toEqual([UV, 'tool', 'install', 'mlx-audio'])
+  expect(uvRuns[0]).toContain('misaki[en]')
+  expect(uvRuns[1]).toEqual([
+    UV, 'pip', 'install', '--python', `${HOME}/.local/share/uv/tools/mlx-audio/bin/python`,
+    expect.stringMatching(/en_core_web_sm-3\.8\.0/),
+  ])
+  expect(runs.filter(r => r[0] === '/bin/sh')).toHaveLength(1)
+  const warms = runs.filter(r => r[0] === '/usr/bin/curl' && r.includes('/dev/null') && r.includes('@-'))
+  expect(warms.length).toBeGreaterThanOrEqual(2)
+  expect(statuses.filter(t => t !== undefined).map(t => /step (\d)\/4/.exec(t!)?.[1])).toEqual(['1', '2', '3', '4'])
+  expect(statuses.at(-1)).toBeUndefined()
+  expect(stored.get('engine')).toBe('kokoro')
+  expect(stored.has('installNoticeAt')).toBe(false)
+  expect(toasts.at(-1)).toMatch(/installed/)
+})
+
+test('/speak-install reports the failing step with its error, and leaves the engine alone', async ($, on) => {
+  const clock = mock.clock(on)
+  const toasts: string[] = []
+  const statuses: (string | undefined)[] = []
+  const stored = new Map<string, unknown>(Object.entries({ engine: 'say' }))
+  world(on, [], undefined, stored, {
+    kokoro: { isInstalled: false },
+    uvAt: UV,
+    uvFails: { step: 'pip install', stderr: 'resolving...\nerror: network unreachable\n' },
+    toasts,
+    statuses,
+  })
+  await runCommand($, 'speak-install')
+  await clock.settle()
+  expect(toasts.at(-1)).toMatch(/step 2\/4 \(spaCy English model\).*network unreachable/s)
+  expect(stored.get('engine')).toBe('say')
+  expect(statuses.at(-1)).toBeUndefined()
+})
+
+test('/speak-install when Kokoro already runs says so; --repair reinstalls with --force', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const runs: (readonly string[])[] = []
+  world(on, [], undefined, new Map(), { kokoro: UP, uvAt: UV, runs })
+  expect((await runCommand($, 'speak-install')).text).toMatch(/already installed and its server is running/)
+  expect(runs.filter(r => r[0] === UV)).toHaveLength(0)
+  expect((await runCommand($, 'speak-install', '--repair')).text).toMatch(/Reinstalling Kokoro/)
+  await clock.settle()
+  expect(runs.filter(r => r[0] === UV)[0]?.slice(0, 4)).toEqual([UV, 'tool', 'install', '--force'])
+  expect(runs.filter(r => r[0] === '/bin/kill')).toEqual([['/bin/kill', '4242']])
+  expect((await runCommand($, 'speak-install', 'please')).text).toMatch(/Usage/)
 })

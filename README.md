@@ -2,7 +2,7 @@
 
 A Claude Code mod that reads Claude's responses aloud.
 
-Every reply in the transcript gets a 🔊 button. Press it to hear that reply; it turns into ■ while reading, and pressing it again stops. Markdown is cleaned up before speaking: formatting marks and link URLs are dropped, and code blocks are read as "Code block omitted."
+Every reply in the transcript gets a 🔊 button. Press it to hear that reply; it turns into ■ while reading, and pressing it again stops. Markdown is cleaned up before speaking: formatting marks and link URLs are dropped, and code blocks are skipped (a reply that is only code gets no button).
 
 Speech uses [Kokoro](https://huggingface.co/mlx-community/Kokoro-82M-bf16), a small neural TTS model that runs locally on Apple silicon through `mlx-audio`. If Kokoro isn't installed or its server fails, the mod falls back to macOS `say` automatically (one toast says so).
 
@@ -12,17 +12,33 @@ Each paragraph is read in its own language — **English or Spanish** — with a
 
 ## Install
 
-In a Claude Code session in a terminal:
+1. In a Claude Code session in a terminal:
 
-```
-/plugin install speak-aloud --marketplace tiger3645/claude-tts
-```
+   ```
+   /plugin install speak-aloud --marketplace tiger3645/claude-tts
+   ```
 
-Answer `y` to add the marketplace, then pick a scope (user scope loads it in every session).
+   Answer `y` to add the marketplace, then pick a scope (user scope loads it in every session). It works right away with macOS `say`.
 
-### Kokoro (recommended)
+2. For the natural Kokoro voices, run:
 
-Install `mlx-audio` with [uv](https://docs.astral.sh/uv/), plus the extras its server and the English and Spanish pipelines need:
+   ```
+   /speak-install
+   ```
+
+   It needs [uv](https://docs.astral.sh/uv/) (`brew install uv`, or `curl -LsSf https://astral.sh/uv/install.sh | sh`). The install runs in the background with its progress in the status line: it installs `mlx-audio` and its extras, the spaCy English model, starts the server and downloads the model (~680 MB the first time), warming English and Spanish. When it's done, reads switch to Kokoro — no restart. `/speak-install --repair` reinstalls everything.
+
+   Until Kokoro is installed, the mod reads with `say` and reminds you about `/speak-install` at most once a day.
+
+### How Kokoro runs
+
+The mod starts `mlx_audio.server` on `127.0.0.1:8765` when a session starts (or reuses one already answering there) and loads the model, so reads start in well under a second. The server runs detached and is shared by every session on the machine: a `/reload-plugins` keeps it, and it is stopped when the last session using it ends. Its logs, the session registry and temporary WAVs live in `~/Library/Caches/speak-aloud/`.
+
+Text is split into paragraphs and chunks of a few sentences; the next chunk is generated while the current one plays (`curl` to the server, `afplay` to play).
+
+### Manual install / troubleshooting
+
+`/speak-install` runs these two commands; run them yourself if it fails:
 
 ```
 uv tool install mlx-audio --with uvicorn --with fastapi --with python-multipart --with webrtcvad-wheels --with "misaki[en]" --with num2words --with spacy --with phonemizer-fork --with espeakng-loader
@@ -31,9 +47,7 @@ uv pip install --python ~/.local/share/uv/tools/mlx-audio/bin/python https://git
 
 Re-run the second command after any `uv tool install --force` or upgrade of `mlx-audio`.
 
-The mod looks for `~/.local/bin/mlx_audio.server`. The model (`mlx-community/Kokoro-82M-bf16`) downloads from Hugging Face on first use.
-
-How it runs: when a session starts, the mod starts `mlx_audio.server` on `127.0.0.1:8765` (or reuses one already listening there) and loads the model, so reads start in well under a second. Text is split into paragraphs and chunks of a few sentences; the next chunk is generated while the current one plays (`curl` to the server, `afplay` to play). The server is stopped when the session ends. Temporary WAV files go to a `mktemp` directory and are deleted after playing.
+The mod looks for `~/.local/bin/mlx_audio.server`. If reads fall back to `say`, check `/speak-engine` and the server log in `~/Library/Caches/speak-aloud/logs/server.log`.
 
 ## Commands
 
@@ -41,6 +55,7 @@ How it runs: when a session starts, the mod starts `mlx_audio.server` on `127.0.
 | --- | --- |
 | `/speak` | Read Claude's latest response aloud |
 | `/speak-stop` | Stop reading |
+| `/speak-install` | Install Kokoro (needs uv); `--repair` reinstalls |
 | `/speak-engine` | Show the engine and whether Kokoro is installed / running |
 | `/speak-engine kokoro\|say` | Choose the engine (default `kokoro`); `default` resets it |
 | `/speak-voice` | Show the English and Spanish voices for the current engine, and the voices to choose from |
@@ -70,7 +85,6 @@ Each paragraph is classified as English or Spanish by counting common words of e
 
 - When a reply is split by tool calls, each text part gets its own button.
 - `/speak` reads the whole latest reply but doesn't highlight a button while it reads; `/speak-stop` stops it.
-- `/reload-plugins` stops the Kokoro server the mod started; the next read starts it again (a few seconds).
 
 ## Development
 

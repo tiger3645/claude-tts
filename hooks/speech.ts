@@ -40,14 +40,14 @@ export function kokoroRequestBody(text: string, lang: Lang, voice: string, wpm: 
   })
 }
 
-/** curl posting the body on stdin to the server, the WAV written to `out`. */
-export function kokoroCurlArgv(out: string): string[] {
+/** curl posting the body on stdin to the server, the WAV written to `out`, giving up after `maxSeconds`. */
+export function kokoroCurlArgv(out: string, maxSeconds = 120): string[] {
   return [
     '/usr/bin/curl',
     '-sS',
     '-f',
     '-m',
-    '120',
+    String(maxSeconds),
     '-X',
     'POST',
     '-H',
@@ -60,16 +60,9 @@ export function kokoroCurlArgv(out: string): string[] {
   ]
 }
 
-/** curl asking whether the server answers at all. */
-export const HEALTH_ARGV: readonly string[] = ['/usr/bin/curl', '-sf', '-m', '1', '-o', '/dev/null', `${KOKORO_URL}/`]
-
 /** Where uv puts the mlx-audio tools, under the home directory. */
 export function kokoroServerPath(home: string): string {
   return `${home}/.local/bin/mlx_audio.server`
-}
-
-export function kokoroServerArgv(home: string): string[] {
-  return [kokoroServerPath(home), '--host', '127.0.0.1', '--port', String(KOKORO_PORT)]
 }
 
 /** The Kokoro voices directory's parent, in the Hugging Face cache. */

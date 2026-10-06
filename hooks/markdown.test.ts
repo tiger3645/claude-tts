@@ -2,13 +2,14 @@ import { expect, test } from 'claude-code/testing'
 
 import { stripMarkdown } from './markdown'
 
-test('drops fenced code blocks, saying so', () => {
+test('drops fenced code blocks silently', () => {
   const text = 'Run this:\n\n```ts\nconst x = 1\n```\n\nDone.'
-  expect(stripMarkdown(text)).toBe('Run this:\n\nCode block omitted.\n\nDone.')
+  expect(stripMarkdown(text)).toBe('Run this:\n\nDone.')
 })
 
 test('drops tilde fences too', () => {
-  expect(stripMarkdown('~~~\nls\n~~~')).toBe('Code block omitted.')
+  expect(stripMarkdown('~~~\nls\n~~~')).toBe('')
+  expect(stripMarkdown('Before\n```\nx\n```\nAfter')).toBe('Before\n\nAfter')
 })
 
 test('keeps inline code text but drops the backticks', () => {

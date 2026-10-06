@@ -1,7 +1,7 @@
 {
   "name": "speak-aloud",
-  "version": "0.2.0",
-  "description": "Reads Claude's responses aloud with local Kokoro neural voices (macOS say as fallback), detecting English and Spanish per paragraph: a speaker button on each reply block, /speak and /speak-stop, and /speak-engine, /speak-voice and /speak-rate settings.",
+  "version": "0.3.0",
+  "description": "Reads Claude's responses aloud with local Kokoro neural voices (macOS say as fallback), detecting English and Spanish per paragraph: a speaker button on each reply block, /speak and /speak-stop, /speak-install to set up Kokoro, and /speak-engine, /speak-voice and /speak-rate settings.",
   "author": {
     "name": "Emilio Mendez"
   },

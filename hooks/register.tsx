@@ -8,6 +8,15 @@ import type {
   Register,
 } from 'claude-code'
 
+import {
+  INSTALL_NOTICE,
+  UV_HELP,
+  shouldShowInstallNotice,
+  spacyInstallArgv,
+  tail,
+  uvCandidates,
+  uvInstallArgv,
+} from './install'
 import type { Lang } from './language'
 import { stripMarkdown } from './markdown'
 import {
@@ -30,14 +39,29 @@ import {
   toSettings,
 } from './settings'
 import {
-  BUILTIN_KOKORO_VOICES,
   HEALTH_ARGV,
+  HEARTBEAT_MS,
+  LISTENER_ARGV,
+  STALE_WAV_MINUTES,
+  cacheDir,
+  daemonArgv,
+  entryName,
+  hasOtherLiveSessions,
+  isHealthyReply,
+  isKokoroServerCommand,
+  kokoroServerArgv,
+  logDir,
+  parsePids,
+  registryDir,
+  wavDir,
+} from './server'
+import {
+  BUILTIN_KOKORO_VOICES,
   KOKORO_PORT,
   type Engine,
   type Segment,
   kokoroCurlArgv,
   kokoroRequestBody,
-  kokoroServerArgv,
   kokoroServerPath,
   kokoroSnapshotsPath,
   kokoroVoicesFor,
@@ -57,19 +81,28 @@ type Utterance = { children: Set<Child>; isStopped: boolean }
 /** How often, and how many times, a starting Kokoro server is asked whether it is up: 30 s in all. */
 const SERVER_POLL_MS = 250
 const SERVER_POLLS = 120
+/** Each install step may take up to ten minutes, `$.process.run`'s most. */
+const INSTALL_STEP_MS = 600_000
+/** When the install notice was last shown, in `$.store`. */
+const NOTICE_KEY = 'installNoticeAt'
 
-// Module variables reset on a reload, and an unload kills every child too
-// (the server included), so a stale `speaking` left in $.state reads as idle.
+// Module variables reset on a reload, and an unload kills every child, so a
+// stale `speaking` left in $.state reads as idle. The Kokoro server is no
+// child: it runs detached, shared by the sessions in the registry.
 let current: Utterance | null = null
 let hasRegistered = false
 let hasWarned = false
-/** The Kokoro server this module started; one already up on the port is reused instead. */
-let server: Child | null = null
 let serverStarting: Promise<boolean> | null = null
-let tempDir: string | null = null
+/** This session's registry entry, once it uses the server. */
+let registryEntry: string | null = null
+let heartbeat: { cancel: () => void } | null = null
+let wavDirReady: string | null = null
+/** Keeps this load's WAV names apart from other sessions' in the shared directory. */
+const loadToken = Math.random().toString(36).slice(2, 10)
 let fileCount = 0
 /** The first Spanish `say` voice; undefined until looked up, null when there is none. */
 let spanishSayVoice: string | null | undefined
+let isInstalling = false
 
 function log($: EngineInterface, text: string) {
   $.ui.log(`speak-aloud: ${text}`, { to: 'debug' })
@@ -89,6 +122,11 @@ async function registerCommands($: EngineInterface) {
       name: 'speak-rate',
       description: 'Set the reading speed in words per minute (80-500)',
       argumentHint: '[wpm|default]',
+    })
+    await $.command.register({
+      name: 'speak-install',
+      description: 'Install Kokoro, the natural local voices (needs uv); --repair reinstalls',
+      argumentHint: '[--repair]',
     })
     await $.command.register({
       name: 'speak-engine',
@@ -171,66 +209,179 @@ async function isKokoroInstalled($: EngineInterface): Promise<boolean> {
 
 async function isServerUp($: EngineInterface): Promise<boolean> {
   try {
-    return (await $.process.run(HEALTH_ARGV, { timeoutMs: 3000 })).exitCode === 0
+    const { exitCode, stdout } = await $.process.run(HEALTH_ARGV, { timeoutMs: 3000 })
+    return isHealthyReply(exitCode, stdout)
   } catch {
+    return false
+  }
+}
+
+/** Makes the plugin's cache directories; resolves whether they are there. */
+async function ensureCacheDirs($: EngineInterface, dir: string): Promise<boolean> {
+  try {
+    const made = await $.process.run(['/bin/mkdir', '-p', registryDir(dir), wavDir(dir), logDir(dir)])
+    return made.exitCode === 0
+  } catch (error) {
+    log($, `could not make the cache directories: ${String(error)}`)
     return false
   }
 }
 
 /** Starts the Kokoro server unless one answers on the port; resolves whether it is up. */
 async function ensureServer($: EngineInterface): Promise<boolean> {
-  if (await isServerUp($)) return true
-  serverStarting ??= startServer($).finally(() => {
-    serverStarting = null
-  })
-  return serverStarting
+  const isUp = await isServerUp($)
+  if (!isUp) {
+    serverStarting ??= startServer($).finally(() => {
+      serverStarting = null
+    })
+    if (!(await serverStarting)) return false
+  }
+  await joinRegistry($)
+  return true
 }
 
 async function startServer($: EngineInterface): Promise<boolean> {
   const dir = await home($)
-  if (dir === undefined || !(await isKokoroInstalled($))) return false
-  if (server === null) {
-    const child = $.process.spawn({ argv: kokoroServerArgv(dir) })
-    server = child
-    // The loop is the server's life: it runs on until session.end or the unload ends it.
-    void (async () => {
-      try {
-        for await (const _chunk of child) {
-          // The server's request log is not worth keeping.
-        }
-      } catch (error) {
-        log($, `the Kokoro server stopped: ${String(error)}`)
-      } finally {
-        if (server === child) server = null
-      }
-    })()
+  if (dir === undefined || !(await isKokoroInstalled($)) || !(await ensureCacheDirs($, dir))) return false
+  try {
+    // Detached, in the cache directory: a reload leaves it running, and no `logs/` lands in the project.
+    const started = await $.process.run(daemonArgv(kokoroServerArgv(dir)), {
+      cwd: cacheDir(dir),
+      env: { SPEAK_ALOUD_LOG: `${logDir(dir)}/server.log` },
+    })
+    if (started.exitCode !== 0) {
+      log($, `could not start the Kokoro server: ${tail(started.stderr, 5)}`)
+      return false
+    }
+  } catch (error) {
+    log($, `could not start the Kokoro server: ${String(error)}`)
+    return false
   }
   for (let i = 0; i < SERVER_POLLS; i++) {
     await $.clock.sleep(SERVER_POLL_MS)
     if (await isServerUp($)) return true
-    if (server === null) return false
   }
+  log($, `the Kokoro server did not answer in time; see ${logDir(dir)}/server.log`)
   return false
 }
 
-function stopServer() {
-  const was = server
-  server = null
-  if (was !== null) void was.return({ code: null, signal: 'SIGTERM' }).catch(() => {})
+/** Writes this session's heartbeat into the registry. */
+async function beat($: EngineInterface, dir: string, name: string) {
+  try {
+    await $.fs.write(`${registryDir(dir)}/${name}`, String(await $.clock.now()))
+  } catch (error) {
+    log($, `could not write the session registry: ${String(error)}`)
+  }
 }
 
-/** Starts the server and has it load the model, so the first read is quick. */
-async function warmKokoro($: EngineInterface) {
-  const settings = await readSettings($)
-  if (settings.engine !== 'kokoro' || !(await ensureServer($))) return
+/** Marks this session as one using the server, once per load, and keeps the mark fresh. */
+async function joinRegistry($: EngineInterface) {
+  if (registryEntry !== null) return
+  const dir = await home($)
+  if (dir === undefined) return
+  let id = 'session'
   try {
-    await $.process.run(kokoroCurlArgv('/dev/null'), {
-      stdin: kokoroRequestBody('Ready.', 'en', settings.voices.kokoro.en, settings.rate),
-      timeoutMs: 60_000,
-    })
-  } catch (error) {
-    log($, `could not warm the Kokoro model: ${String(error)}`)
+    id = await $.session.id()
+  } catch {
+    // One entry under a fixed name still keeps the server for this session.
   }
+  const name = entryName(id)
+  registryEntry = name
+  if (!(await ensureCacheDirs($, dir))) return
+  await beat($, dir, name)
+  heartbeat ??= $.clock.every(HEARTBEAT_MS, () => void beat($, dir, name))
+}
+
+/**
+ * At the session's end: drops its registry entry and, when no other live
+ * session uses the server, stops it. `force` (a repair) stops it regardless.
+ */
+async function leaveRegistry($: EngineInterface, force = false) {
+  const name = registryEntry
+  registryEntry = null
+  heartbeat?.cancel()
+  heartbeat = null
+  const dir = await home($)
+  if (dir === undefined || (name === null && !force)) return
+  try {
+    if (name !== null) await $.process.run(['/bin/rm', '-f', `${registryDir(dir)}/${name}`])
+    if (!force) {
+      const entries: { name: string; text: string }[] = []
+      for (const entry of await $.fs.list(registryDir(dir))) {
+        if (entry.kind !== 'file') continue
+        entries.push({ name: entry.name, text: await $.fs.read(`${registryDir(dir)}/${entry.name}`) })
+      }
+      if (hasOtherLiveSessions(entries, name ?? '', await $.clock.now())) return
+    }
+    await killServer($)
+  } catch (error) {
+    log($, `could not stop the Kokoro server: ${String(error)}`)
+  }
+}
+
+/** Kills whatever mlx-audio server listens on the port (only an mlx-audio server). */
+async function killServer($: EngineInterface) {
+  const { stdout } = await $.process.run(LISTENER_ARGV)
+  for (const pid of parsePids(stdout)) {
+    const ps = await $.process.run(['/bin/ps', '-p', String(pid), '-o', 'command='])
+    if (isKokoroServerCommand(ps.stdout)) await $.process.run(['/bin/kill', String(pid)])
+  }
+}
+
+/**
+ * Has the server load the model for each language, so the first read is
+ * quick; resolves whether every request went through. A first run downloads
+ * the model, so the install gives it longer.
+ */
+async function warmModel($: EngineInterface, settings: Settings, langs: readonly Lang[], timeoutMs = 60_000) {
+  let isWarm = true
+  for (const lang of langs) {
+    try {
+      const said = lang === 'es' ? 'Listo.' : 'Ready.'
+      const { exitCode, stderr } = await $.process.run(kokoroCurlArgv('/dev/null', Math.floor(timeoutMs / 1000) - 5), {
+        stdin: kokoroRequestBody(said, lang, settings.voices.kokoro[lang], settings.rate),
+        timeoutMs,
+      })
+      if (exitCode !== 0) {
+        isWarm = false
+        log($, `could not warm the Kokoro model (${lang}): ${tail(stderr, 5)}`)
+      }
+    } catch (error) {
+      isWarm = false
+      log($, `could not warm the Kokoro model (${lang}): ${String(error)}`)
+    }
+  }
+  return isWarm
+}
+
+/**
+ * At load: with Kokoro chosen and installed, start its server and load the
+ * model; chosen but missing, say how to install it (at most once a day).
+ * With say chosen it does nothing.
+ */
+async function startKokoro($: EngineInterface) {
+  const settings = await readSettings($)
+  if (settings.engine !== 'kokoro' || isInstalling) return
+  if (!(await isKokoroInstalled($))) {
+    await noticeInstall($)
+    return
+  }
+  if (await ensureServer($)) await warmModel($, settings, ['en'])
+}
+
+/** The install notice, as a toast, unless shown in the last day; it stands in for the fallback toast. */
+async function noticeInstall($: EngineInterface) {
+  try {
+    const now = await $.clock.now()
+    if (!shouldShowInstallNotice(await $.store.get(NOTICE_KEY), now)) return
+    await $.store.set(NOTICE_KEY, now)
+  } catch (error) {
+    log($, `could not check the install notice: ${String(error)}`)
+    return
+  }
+  hasWarned = true
+  log($, INSTALL_NOTICE)
+  $.ui.toast(`speak-aloud: ${INSTALL_NOTICE}`, { timeoutMs: 15_000 })
 }
 
 /** Says once per load, in the debug log and a toast, that Kokoro gave way to `say`. */
@@ -241,26 +392,23 @@ function warnFallback($: EngineInterface, why: string) {
   $.ui.toast(`speak-aloud: Kokoro is unavailable (${why}); reading with say.`)
 }
 
-async function ensureTempDir($: EngineInterface): Promise<string | undefined> {
-  if (tempDir !== null) return tempDir
-  try {
-    const { exitCode, stdout } = await $.process.run(['/usr/bin/mktemp', '-d', '-t', 'speak-aloud'])
-    const dir = stdout.trim()
-    if (exitCode === 0 && dir.startsWith('/')) tempDir = dir
-  } catch (error) {
-    log($, `could not make a temporary directory: ${String(error)}`)
-  }
-  return tempDir ?? undefined
+/**
+ * The shared WAV directory, made once per load; WAVs a read long done left
+ * behind (a reload mid-read) are cleared then.
+ */
+async function ensureWavDir($: EngineInterface): Promise<string | undefined> {
+  if (wavDirReady !== null) return wavDirReady
+  const dir = await home($)
+  if (dir === undefined || !(await ensureCacheDirs($, dir))) return undefined
+  wavDirReady = wavDir(dir)
+  void $.process
+    .run(['/usr/bin/find', wavDirReady, '-name', '*.wav', '-mmin', `+${STALE_WAV_MINUTES}`, '-delete'])
+    .catch(() => {})
+  return wavDirReady
 }
 
 function removeFile($: EngineInterface, path: string) {
   void $.process.run(['/bin/rm', '-f', path]).catch(() => {})
-}
-
-function removeTempDir($: EngineInterface) {
-  const dir = tempDir
-  tempDir = null
-  if (dir !== null && dir.includes('speak-aloud')) void $.process.run(['/bin/rm', '-rf', dir]).catch(() => {})
 }
 
 /** The `say` voice for a language: the one set, else for Spanish the first Spanish voice. */
@@ -294,10 +442,10 @@ async function runChild($: EngineInterface, mine: Utterance, request: ProcessSpa
 
 /** Has the server make one segment's WAV; resolves its path, or undefined when it failed. */
 async function generate($: EngineInterface, mine: Utterance, segment: Segment, settings: Settings) {
-  const dir = await ensureTempDir($)
+  const dir = await ensureWavDir($)
   if (dir === undefined) return undefined
   fileCount += 1
-  const out = `${dir}/${fileCount}.wav`
+  const out = `${dir}/${loadToken}-${fileCount}.wav`
   const voice = settings.voices.kokoro[segment.lang]
   const code = await runChild($, mine, {
     argv: kokoroCurlArgv(out),
@@ -308,15 +456,19 @@ async function generate($: EngineInterface, mine: Utterance, segment: Segment, s
   return undefined
 }
 
+/** Ends a read at once: marks it stopped and kills every child it has running. */
+function halt(utterance: Utterance | null) {
+  if (utterance === null) return
+  utterance.isStopped = true
+  // Not awaited: ending each loop kills its child, and nothing waits on its last words.
+  for (const child of utterance.children) void child.return({ code: null, signal: 'SIGTERM' }).catch(() => {})
+}
+
 /** Stops the current read, if any; resolves whether one was running. */
 async function stop($: EngineInterface): Promise<boolean> {
   const was = current
   current = null
-  if (was !== null) {
-    was.isStopped = true
-    // Not awaited: ending each loop kills its child, and nothing waits on its last words.
-    for (const child of was.children) void child.return({ code: null, signal: 'SIGTERM' }).catch(() => {})
-  }
+  halt(was)
   await update($, speaking, () => '')
   return was !== null
 }
@@ -325,7 +477,8 @@ async function stop($: EngineInterface): Promise<boolean> {
 async function engineFor($: EngineInterface, settings: Settings): Promise<Engine> {
   if (settings.engine !== 'kokoro') return 'say'
   if (await ensureServer($)) return 'kokoro'
-  warnFallback($, (await isKokoroInstalled($)) ? 'its server did not start' : 'mlx-audio is not installed')
+  if (await isKokoroInstalled($)) warnFallback($, 'its server did not start')
+  else await noticeInstall($)
   return 'say'
 }
 
@@ -335,12 +488,16 @@ async function engineFor($: EngineInterface, settings: Settings): Promise<Engine
  * is read in its language; with Kokoro, the next chunk is made while one plays.
  */
 async function speak($: EngineInterface, markdown: string, key: string): Promise<void> {
-  await stop($)
   const text = stripMarkdown(markdown)
-  if (text === '') return
-
+  // Before any await: a second read started meanwhile must find this one current, to stop it.
   const mine: Utterance = { children: new Set(), isStopped: false }
+  halt(current)
   current = mine
+  if (text === '') {
+    current = null
+    await update($, speaking, () => '')
+    return
+  }
   await update($, speaking, () => key)
   const made = new Map<number, Promise<string | undefined>>()
   try {
@@ -456,7 +613,7 @@ async function rateCommand($: EngineInterface, args: string): Promise<string> {
 async function kokoroStatus($: EngineInterface): Promise<string> {
   if (await isServerUp($)) return `Kokoro: installed, server running on 127.0.0.1:${KOKORO_PORT}.`
   if (await isKokoroInstalled($)) return 'Kokoro: installed; its server starts on the first read.'
-  return 'Kokoro: not installed (see the README); reading falls back to say.'
+  return 'Kokoro: not installed; run /speak-install. Reading falls back to say.'
 }
 
 /** `/speak-engine [kokoro|say|default]`: answers the command's text. */
@@ -471,8 +628,101 @@ async function engineCommand($: EngineInterface, args: string): Promise<string> 
   if (wanted === 'default') await $.store.delete('engine')
   else await $.store.set('engine', engine)
   if (engine === 'say') return 'Engine set to say.'
-  $.clock.after(0, () => void warmKokoro($))
+  $.clock.after(0, () => void startKokoro($))
   return `Engine set to kokoro.\n${await kokoroStatus($)}`
+}
+
+/** Finds uv where its installer or Homebrew puts it. */
+async function findUv($: EngineInterface, dir: string): Promise<string | undefined> {
+  for (const path of uvCandidates(dir)) {
+    try {
+      if (await $.fs.exists(path)) return path
+    } catch {
+      // Not readable: try the next.
+    }
+  }
+  return undefined
+}
+
+function installStatus($: EngineInterface, step: number, what: string) {
+  $.ui.status(`speak-aloud: installing Kokoro, step ${step}/4: ${what}…`)
+}
+
+/** Runs the install's steps in order; resolves the failure's message, or undefined when all went through. */
+async function installSteps($: EngineInterface, uv: string, dir: string, isRepair: boolean) {
+  const commands: [string, string[]][] = [
+    ['mlx-audio (uv tool install)', uvInstallArgv(uv, isRepair)],
+    ['spaCy English model', spacyInstallArgv(uv, dir)],
+  ]
+  for (const [i, [what, argv]] of commands.entries()) {
+    installStatus($, i + 1, what)
+    try {
+      const { exitCode, stdout, stderr } = await $.process.run(argv, { timeoutMs: INSTALL_STEP_MS })
+      if (exitCode !== 0) {
+        log($, `install step ${i + 1} failed (${exitCode}):\n${stderr || stdout}`)
+        return `step ${i + 1}/4 (${what}) failed: ${tail(stderr || stdout, 6) || `exit code ${exitCode}`}`
+      }
+    } catch (error) {
+      return `step ${i + 1}/4 (${what}) failed: ${String(error)}`
+    }
+  }
+  installStatus($, 3, 'starting the Kokoro server')
+  if (!(await ensureServer($))) return 'step 3/4 (starting the Kokoro server) failed: it did not answer within 30 s.'
+  installStatus($, 4, 'downloading the model (~680 MB the first time) and warming English and Spanish')
+  const settings = await readSettings($)
+  if (!(await warmModel($, settings, ['en', 'es'], INSTALL_STEP_MS))) {
+    return 'step 4/4 (downloading and warming the model) failed; see the debug log.'
+  }
+  return undefined
+}
+
+async function runInstall($: EngineInterface, uv: string, dir: string, isRepair: boolean) {
+  isInstalling = true
+  try {
+    // A repair replaces the Python the running server was started from.
+    if (isRepair) await leaveRegistry($, true)
+    const failure = await installSteps($, uv, dir, isRepair)
+    if (failure === undefined) {
+      await $.store.set('engine', 'kokoro')
+      await $.store.delete(NOTICE_KEY)
+      hasWarned = false
+      $.ui.toast('speak-aloud: Kokoro is installed — reading with natural voices.', { timeoutMs: 10_000 })
+    } else {
+      log($, `Kokoro install failed at ${failure}`)
+      $.ui.toast(`speak-aloud: Kokoro install failed at ${failure}\nReading with say until it is fixed; /speak-install --repair retries.`, {
+        timeoutMs: 30_000,
+      })
+    }
+  } catch (error) {
+    log($, `Kokoro install failed: ${String(error)}`)
+    $.ui.toast(`speak-aloud: Kokoro install failed: ${String(error)}`, { timeoutMs: 30_000 })
+  } finally {
+    isInstalling = false
+    $.ui.status(undefined)
+  }
+}
+
+/** `/speak-install [--repair]`: answers at once; the install runs on, its progress in the status line. */
+async function installCommand($: EngineInterface, args: string): Promise<string> {
+  const wanted = args.trim().toLowerCase()
+  if (wanted !== '' && wanted !== '--repair' && wanted !== 'repair') return 'Usage: /speak-install [--repair]'
+  const isRepair = wanted !== ''
+  if (isInstalling) return 'Kokoro is already being installed; progress is in the status line.'
+  const dir = await home($)
+  if (dir === undefined) return 'Could not install Kokoro: HOME is not set.'
+
+  if (!isRepair && (await isKokoroInstalled($))) {
+    await $.store.set('engine', 'kokoro')
+    if (await isServerUp($)) return 'Kokoro is already installed and its server is running. /speak-install --repair reinstalls it.'
+    $.clock.after(0, () => void startKokoro($))
+    return 'Kokoro is already installed; starting its server. /speak-install --repair reinstalls it.'
+  }
+
+  const uv = await findUv($, dir)
+  if (uv === undefined) return UV_HELP
+  // On a timer, so the install outlives this command's dispatch.
+  $.clock.after(0, () => void runInstall($, uv, dir, isRepair))
+  return `${isRepair ? 'Reinstalling' : 'Installing'} Kokoro… progress in the status line.`
 }
 
 export const register: Register = on => {
@@ -485,14 +735,14 @@ export const register: Register = on => {
       log($, `could not read the transcript: ${String(error)}`)
     }
     // On a timer, so the server outlives this dispatch.
-    $.clock.after(0, () => void warmKokoro($))
+    $.clock.after(0, () => void startKokoro($))
     return started
   })
 
   on('session.end', async ($, e, next) => {
     await stop($)
-    stopServer()
-    removeTempDir($)
+    // A /clear or a resume goes on in this process, still reading aloud.
+    if (e.reason !== 'clear' && e.reason !== 'resume') await leaveRegistry($)
     if (e.reason === 'clear') await update($, latest, () => '')
     return next(e)
   })
@@ -505,7 +755,7 @@ export const register: Register = on => {
     // A mod enabled or reloaded mid-session never sees session.start.
     if (!hasRegistered) {
       await registerCommands($)
-      $.clock.after(0, () => void warmKokoro($))
+      $.clock.after(0, () => void startKokoro($))
     }
     return done
   })
@@ -529,6 +779,8 @@ export const register: Register = on => {
 
   on('command.run', { command: 'speak-engine' }, async ($, e) => ({ text: await engineCommand($, e.args) }))
 
+  on('command.run', { command: 'speak-install' }, async ($, e) => ({ text: await installCommand($, e.args) }))
+
   // A speaker button beside each reply block, the block itself the engine's own drawing.
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     const drawn = await next(e)
@@ -547,7 +799,14 @@ export const register: Register = on => {
         {isOn ? (
           <Button key="stop" label="■" onPress={() => stop($)} />
         ) : (
-          <Button key="speak" label="🔊" onPress={() => speak($, text, key)} />
+          <Button
+            key="speak"
+            label="🔊"
+            // On a timer, so the read and its children outlive the press's dispatch.
+            onPress={() => {
+              $.clock.after(0, () => void speak($, text, key))
+            }}
+          />
         )}
       </Box>
     )

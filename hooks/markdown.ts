@@ -1,6 +1,6 @@
 /**
  * Turns a markdown answer into plain text worth hearing: code blocks are
- * announced rather than read, URLs are dropped (link text kept), and the
+ * skipped silently, URLs are dropped (link text kept), and the
  * markers of headings, lists, quotes, emphasis and tables go.
  */
 export function stripMarkdown(text: string): string {
@@ -16,7 +16,8 @@ export function stripMarkdown(text: string): string {
     }
     if (opener !== undefined) {
       fence = opener
-      kept.push('Code block omitted.')
+      // Skipped silently; the blank line keeps the text around it apart.
+      kept.push('')
       continue
     }
     const plain = stripLine(line)
