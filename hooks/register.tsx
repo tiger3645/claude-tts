@@ -781,7 +781,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'speak-install' }, async ($, e) => ({ text: await installCommand($, e.args) }))
 
-  // A speaker button beside each reply block, the block itself the engine's own drawing.
+  // A speaker button on its own line under each reply block, the block itself the engine's own drawing.
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     const drawn = await next(e)
     const text = e.props.text
@@ -792,10 +792,8 @@ export const register: Register = on => {
     const key = e.requestId
     const isOn = (await readSpeaking($)) === key
     return (
-      <Box flexDirection="row">
-        <Box flexDirection="column" flexGrow={1} flexShrink={1}>
-          {drawn}
-        </Box>
+      <Box flexDirection="column" rowGap={1}>
+        {drawn}
         {isOn ? (
           <Button key="stop" label="■" onPress={() => stop($)} />
         ) : (
